@@ -1,136 +1,137 @@
-/* Uart Events Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
+#include <inttypes.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_err.h"
+#include "esp_log.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
-#include "driver/uart.h"
-#include "freertos/queue.h"
-#include "esp_log.h"
 #include "sdkconfig.h"
 
-/**
- * This is a example which echos any data it receives on UART back to the sender using RS485 interface in half duplex mode.
-*/
-#define TAG "RS485_ECHO_APP"
+#include "modbus_handler.h"
+#include "mercury236.h"
 
-// Note: Some pins on target chip cannot be assigned for UART communication.
-// Please refer to documentation for selected board and target to configure pins using Kconfig.
-#define ECHO_TEST_TXD           (CONFIG_ECHO_UART_TXD)
-#define ECHO_TEST_RXD           (CONFIG_ECHO_UART_RXD)
+#define TAG "MERCURY_DEMO"
 
-// RTS for RS485 Half-Duplex Mode manages DE/~RE
-#define ECHO_TEST_RTS           (CONFIG_ECHO_UART_RTS)
+#if CONFIG_FREERTOS_UNICORE
+#define MERCURY_DEMO_CORE 0
+#else
+#define MERCURY_DEMO_CORE APP_CPU_NUM
+#endif
 
-// CTS is not used in RS485 Half-Duplex Mode
-#define ECHO_TEST_CTS           (UART_PIN_NO_CHANGE)
-
-#define BUF_SIZE                (127)
-#define BAUD_RATE               (CONFIG_ECHO_UART_BAUD_RATE)
-
-// Read packet timeout
-#define PACKET_READ_TICS        (100 / portTICK_PERIOD_MS)
-#define ECHO_TASK_STACK_SIZE    (CONFIG_ECHO_TASK_STACK_SIZE)
-#define ECHO_TASK_PRIO          (10)
-#define ECHO_UART_PORT          (CONFIG_ECHO_UART_PORT_NUM)
-
-// Timeout threshold for UART = number of symbols (~10 tics) with unchanged state on receive pin
-#define ECHO_READ_TOUT          (3) // 3.5T * 8 = 28 ticks, TOUT=3 -> ~24..33 ticks
-
-static void echo_send(const int port, const char* str, uint8_t length)
+static void log_serial_info(const mercury236_serial_info_t *info)
 {
-    if (uart_write_bytes(port, str, length) != length) {
-        ESP_LOGE(TAG, "Send data critical failure.");
-        // add your code to handle sending failure here
-        abort();
+    if (!info) {
+        return;
+    }
+    ESP_LOGI(TAG, "Serial: %08" PRIu32 " manufactured on %02u-%02u-%04u",
+             info->serial,
+             info->day,
+             info->month,
+             info->year);
+}
+
+static void log_instant_values(const mercury236_values_t *v)
+{
+    if (!v) {
+        return;
+    }
+    ESP_LOGI(TAG, "U[V]: A=%.1f  B=%.1f  C=%.1f",
+             v->u_a, v->u_b, v->u_c);
+    ESP_LOGI(TAG, "I[A]: A=%.3f  B=%.3f  C=%.3f",
+             v->i_a, v->i_b, v->i_c);
+    ESP_LOGI(TAG, "PF  : A=%.3f  B=%.3f  C=%.3f  Σ=%.3f",
+             v->pf_a, v->pf_b, v->pf_c, v->pf_sum);
+    ESP_LOGI(TAG, "Freq=%.2f Hz  P=%.2f kW  Q=%.2f kvar  S=%.2f kVA",
+             v->freq, v->p_sum, v->q_sum, v->s_sum);
+}
+
+static void mercury_demo_task(void *arg)
+{
+    const uint8_t address = CONFIG_MERCURY236_DEMO_ADDRESS;
+    const bool is_d_variant = CONFIG_MERCURY236_DEMO_IS_D_VARIANT;
+    const TickType_t poll_delay = pdMS_TO_TICKS(CONFIG_MERCURY236_DEMO_POLL_INTERVAL_MS);
+    const TickType_t retry_delay = pdMS_TO_TICKS(CONFIG_MERCURY236_DEMO_RETRY_DELAY_MS);
+
+    mercury236_t meter;
+    mercury236_init(&meter, MERCURY_UART_PORT, address, is_d_variant);
+
+    ESP_LOGI(TAG, "Mercury 236 demo started (addr=%u, variant=%s)",
+             address, is_d_variant ? "D" : "standard");
+
+    bool serial_logged = false;
+
+    while (1) {
+        ESP_LOGI(TAG, "Testing link...");
+        esp_err_t err = mercury236_test_link(&meter);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Ping failed: %s", esp_err_to_name(err));
+            vTaskDelay(retry_delay);
+            continue;
+        }
+
+        err = mercury236_open_lvl1(&meter);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Open L1 failed: %s", esp_err_to_name(err));
+            vTaskDelay(retry_delay);
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Channel L1 opened");
+
+        if (!serial_logged) {
+            mercury236_serial_info_t serial = {0};
+            err = mercury236_read_serial(&meter, &serial);
+            if (err == ESP_OK) {
+                log_serial_info(&serial);
+                uint8_t suggested = mercury236_default_address(serial.serial, is_d_variant);
+                ESP_LOGI(TAG, "Suggested address from serial: %u", suggested);
+                serial_logged = true;
+            } else {
+                ESP_LOGW(TAG, "Serial read failed: %s", esp_err_to_name(err));
+            }
+        }
+
+        while (1) {
+            mercury236_values_t values = {0};
+            err = mercury236_read_instant(&meter, &values);
+            if (err == ESP_OK) {
+                log_instant_values(&values);
+            } else {
+                ESP_LOGW(TAG, "Instant read failed: %s", esp_err_to_name(err));
+                break;
+            }
+            vTaskDelay(poll_delay);
+        }
+
+        mercury236_close(&meter);
+        ESP_LOGI(TAG, "Channel closed, retrying in %u ms", CONFIG_MERCURY236_DEMO_RETRY_DELAY_MS);
+        vTaskDelay(retry_delay);
     }
 }
 
-// An example of echo test with hardware flow control on UART
-static void echo_task(void *arg)
+static void init_nvs(void)
 {
-    const int uart_num = ECHO_UART_PORT;
-    uart_config_t uart_config = {
-        .baud_rate = BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .rx_flow_ctrl_thresh = 122,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-
-    // Set UART log level
-    esp_log_level_set(TAG, ESP_LOG_INFO);
-
-    ESP_LOGI(TAG, "Start RS485 application test and configure UART.");
-
-    // Install UART driver (we don't need an event queue here)
-    // In this example we don't even use a buffer for sending data.
-    ESP_ERROR_CHECK(uart_driver_install(uart_num, BUF_SIZE * 2, 0, 0, NULL, 0));
-
-    // Configure UART parameters
-    ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
-
-    ESP_LOGI(TAG, "UART set pins, mode and install driver.");
-
-    // Set UART pins as per KConfig settings
-    ESP_ERROR_CHECK(uart_set_pin(uart_num, ECHO_TEST_TXD, ECHO_TEST_RXD, ECHO_TEST_RTS, ECHO_TEST_CTS));
-
-    // Set RS485 half duplex mode
-    ESP_ERROR_CHECK(uart_set_mode(uart_num, UART_MODE_RS485_HALF_DUPLEX));
-
-    // Set read timeout of UART TOUT feature
-    ESP_ERROR_CHECK(uart_set_rx_timeout(uart_num, ECHO_READ_TOUT));
-
-    // Allocate buffers for UART
-    uint8_t* data = (uint8_t*) malloc(BUF_SIZE);
-    assert(data);
-
-    ESP_LOGI(TAG, "UART start receive loop.\r");
-    echo_send(uart_num, "Start RS485 UART test.\r\n", 24);
-
-    while (1) {
-        //Read data from UART
-        int len = uart_read_bytes(uart_num, data, BUF_SIZE, PACKET_READ_TICS);
-
-        //Write data back to UART
-        if (len > 0) {
-            echo_send(uart_num, "\r\n", 2);
-            char prefix[] = "RS485 Received: [";
-            echo_send(uart_num, prefix, (sizeof(prefix) - 1));
-            ESP_LOGI(TAG, "Received %u bytes:", len);
-            printf("[ ");
-            for (int i = 0; i < len; i++) {
-                printf("0x%.2X ", (uint8_t)data[i]);
-                echo_send(uart_num, (const char*)&data[i], 1);
-                // Add a Newline character if you get a return character from paste (Paste tests multibyte receipt/buffer)
-                if (data[i] == '\r') {
-                    echo_send(uart_num, "\n", 1);
-                }
-            }
-            printf("] \n");
-            echo_send(uart_num, "]\r\n", 3);
-        } else {
-            // Echo a "." to show we are alive while we wait for input
-            echo_send(uart_num, ".", 1);
-            ESP_ERROR_CHECK(uart_wait_tx_done(uart_num, 10));
-        }
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
     }
-    vTaskDelete(NULL);
+    ESP_ERROR_CHECK(err);
 }
 
 void app_main(void)
 {
-    //A uart read/write example without event queue;
-    xTaskCreate(echo_task, "uart_echo_task", ECHO_TASK_STACK_SIZE, NULL, ECHO_TASK_PRIO, NULL);
+    init_nvs();
+    ESP_ERROR_CHECK(modbus_handler_init());
+
+    xTaskCreatePinnedToCore(mercury_demo_task,
+                            "mercury_demo",
+                            CONFIG_MERCURY236_DEMO_TASK_STACK,
+                            NULL,
+                            CONFIG_MERCURY236_DEMO_TASK_PRIO,
+                            NULL,
+                            MERCURY_DEMO_CORE);
 }
