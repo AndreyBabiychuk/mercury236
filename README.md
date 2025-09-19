@@ -1,82 +1,71 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- |
+# Mercury 236 RS-485 demo
 
-# UART RS485 Echo Example
+This project demonstrates how to drive a *Mercury 236 ART / ART-02* energy
+meter over the native "Mercury" single-packet protocol while sharing the same
+RS-485 bus with the existing Modbus master component.
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+The demo application configures UART1 (RS-485 half-duplex) through
+`modbus_handler_init()`, opens a level 1 session with the meter and periodically
+prints the following data to the serial console:
 
-This is an example which echoes any data it receives on UART port back to the sender in the RS485 network.
-It uses ESP-IDF UART software driver in RS485 half duplex transmission mode and requires external connection of bus drivers.
-The approach demonstrated in this example can be used in user application to transmit/receive data in RS485 networks.
+* Device serial number and production date (read once on start-up).
+* Suggested network address derived from the serial number.
+* Phase voltages, currents, and power factors.
+* Grid frequency along with active, reactive, and apparent power sums.
 
-## How to use example
+## Hardware requirements
 
-### Hardware Required
-PC + USB Serial adapter connected to USB port + RS485 line drivers + Espressif development board.
-The MAX483 line driver is used for example below but other similar chips can be used as well.
+* ESP32 series board with an RS-485 transceiver (tested with MAX485/MAX3485).
+* Mercury 236 ART / ART-02 electricity meter connected to the same RS-485 line.
+* Optional USB-to-RS-485 adapter for monitoring traffic.
 
-#### RS485 example connection circuit schematic:
-```
-         VCC ---------------+                               +--------------- VCC
-                            |                               |
-                    +-------x-------+               +-------x-------+
-         RXD <------| RO            |               |             RO|-----> RXD
-                    |              B|---------------|B              |
-         TXD ------>| DI  MAX483    |    \  /       |    MAX483   DI|<----- TXD
-ESP32 BOARD         |               |   RS-485 side |               |  SERIAL ADAPTER SIDE
-         RTS --+--->| DE            |    /  \       |             DE|---+
-               |    |              A|---------------|A              |   |
-               +----| /RE           |               |            /RE|---+-- RTS
-                    +-------x-------+               +-------x-------+
-                            |                               |
-                           ---                             ---
-```
+UART1 pins and DE/~RE control lines are configured inside `modbus_handler.c`
+(`TXD=GPIO17`, `RXD=GPIO18`, `RTS/DE=GPIO10` by default). Adjust these constants
+if your hardware uses different wiring.
 
-#### Connect an external RS485 serial interface to an ESP32 board
-Connect a USB-to-RS485 adapter to a computer, then connect the adapter's A/B output lines with the corresponding A/B output lines of the RS485 line driver connected to the ESP32 chip (see figure above).
-```
-  ------------------------------------------------------------------------------------------------------------------------------
-  |  UART Interface       | #define            | Default pin for ESP32 | Default pins for others   | External RS485 Driver Pin |
-  | ----------------------|--------------------|-----------------------|---------------------------|---------------------------|
-  | Transmit Data (TxD)   | CONFIG_MB_UART_TXD | GPIO23                | GPIO9                     | DI                        |
-  | Receive Data (RxD)    | CONFIG_MB_UART_RXD | GPIO22                | GPIO8                     | RO                        |
-  | Request To Send (RTS) | CONFIG_MB_UART_RTS | GPIO18                | GPIO10                    | ~RE/DE                    |
-  | Ground                | n/a                | GND                   | GND                       | GND                       |
-  ------------------------------------------------------------------------------------------------------------------------------
-```
-Note: Each target chip has different GPIO pins available for UART connection. Please refer to UART documentation for selected target for more information.
+## Configuration
 
-### Configure the project
+Use the project menuconfig to point the demo at your device:
+
 ```
 idf.py menuconfig
 ```
 
-### Build and Flash
-Build the project and flash it to the board, then run monitor tool to view serial output:
+Navigate to **Mercury 236 demo configuration** and set:
+
+* **Mercury 236 network address** – RS-485 address of your meter (47 for serial
+  `51664847` without the "D" suffix).
+* **Meter has "D" index (ASCII passwords)** – enable for models that expect
+  ASCII passwords (factory default `"111111"`/`"222222"`). Leave disabled for
+  standard HEX-password devices (`0x111111`/`0x222222`).
+* **Polling interval** – how often instantaneous values are read while the
+  channel is open.
+* **Retry delay** – wait time before re-opening the channel after a failure.
+* **Demo task stack size / priority** – FreeRTOS parameters for the polling task
+  in case you need to tune them for your firmware.
+
+## Building and running
+
+Build, flash and monitor as usual:
+
 ```
 idf.py -p PORT flash monitor
 ```
 
-(To exit the serial monitor, type ``Ctrl-]``.)
+Example console output after a successful poll:
 
-See the Getting Started Guide for full steps to configure and use ESP-IDF to build projects.
-
-#### Setup external terminal software
-Refer to the example and set up a serial terminal program to the same settings as of UART in ESP32-WROVER-KIT board.
-Open the external serial interface in the terminal. By default if no any symbols are received, the application sends character `.` to check transmission side.
-When typing message and push send button in the terminal you should see the message `RS485 Received: [ your message ]`, where "your message" is the message you sent from terminal.
-Verify if echo indeed comes from your board by disconnecting either `TxD` or `RxD` pin. Once done there should be no any `.` displayed.
-
-## Example Output
-Example output of the application:
 ```
-I (655020) RS485_ECHO_APP: Received 12 bytes:
-[ 0x79 0x6F 0x75 0x72 0x20 0x6D 0x65 0x73 0x73 0x61 0x67 0x65 ]
+I (3400) MERCURY_DEMO: Mercury 236 demo started (addr=47, variant=standard)
+I (3410) MERCURY_DEMO: Testing link...
+I (3430) MERCURY_DEMO: Channel L1 opened
+I (3430) MERCURY_DEMO: Serial: 51664847 manufactured on 15-04-2023
+I (3430) MERCURY_DEMO: Suggested address from serial: 47
+I (3450) MERCURY_DEMO: U[V]: A=229.7  B=230.1  C=228.9
+I (3450) MERCURY_DEMO: I[A]: A=3.214  B=3.105  C=3.287
+I (3450) MERCURY_DEMO: PF  : A=0.996  B=0.995  C=0.997  Σ=0.996
+I (3450) MERCURY_DEMO: Freq=49.98 Hz  P=5.40 kW  Q=0.12 kvar  S=5.41 kVA
 ```
-The received message is showed in hexadecimal form in the brackets.
 
-## Troubleshooting
-When example software does not show the `.` symbol, the issue is most likely related to connection errors of the external RS485 interface.
-Check the RS485 interface connection with the environment according to schematic above and restart the application.
-Then start terminal software and open the appropriate serial port.
-
+If the link test or any subsequent request fails, the task logs the error and
+retries after the configured delay. Use these logs to verify wiring, address,
+password settings and general communication health.
